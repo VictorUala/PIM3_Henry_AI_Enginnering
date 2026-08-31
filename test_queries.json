@@ -1,0 +1,50 @@
+[
+    {
+        "query": "¿Cuántos días de vacaciones me corresponden al año?",
+        "expected_intent": "hr"
+    },
+    {
+        "query": "Necesito dar de alta a un nuevo empleado en la obra social.",
+        "expected_intent": "hr"
+    },
+    {
+        "query": "Mi computadora muestra una pantalla azul y se reinicia sola.",
+        "expected_intent": "tech"
+    },
+    {
+        "query": "¿Cómo configuro la VPN para trabajar desde casa?",
+        "expected_intent": "tech"
+    },
+    {
+        "query": "Me rechazaron un gasto en la tarjeta corporativa, ¿qué hago?",
+        "expected_intent": "finance"
+    },
+    {
+        "query": "¿Cuándo depositan el aguinaldo este mes?",
+        "expected_intent": "finance"
+    },
+    {
+        "query": "Quiero solicitar un reembolso por una cena con un cliente.",
+        "expected_intent": "finance"
+    },
+    {
+        "query": "Se rompió el monitor de mi escritorio, necesito uno nuevo.",
+        "expected_intent": "tech"
+    },
+    {
+        "query": "Quiero pedir licencia por maternidad, ¿cuáles son los pasos?",
+        "expected_intent": "hr"
+    },
+    {
+        "query": "No puedo acceder a mi correo, dice contraseña incorrecta.",
+        "expected_intent": "tech"
+    },
+    {
+        "query": "Me robaron la notebook del trabajo en la calle, ¿quién me da una nueva y debo pagarla?",
+        "expected_intent": "tech"
+    },
+    {
+        "query": "Tengo un problema con el pago de mi salario, me depositaron de menos.",
+        "expected_intent": "finance"
+    }
+]

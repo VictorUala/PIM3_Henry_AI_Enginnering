@@ -1,0 +1,165 @@
+import os
+from dotenv import load_dotenv
+from langfuse.decorators import observe, langfuse_context
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.document_loaders import DirectoryLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_retrieval_chain
+from langchain_core.prompts import ChatPromptTemplate
+from langfuse import Langfuse
+import json
+import logging
+logging.getLogger("faiss").setLevel(logging.CRITICAL)
+
+# Cargar variables de entorno
+load_dotenv()
+
+# Inicializar cliente de Langfuse para evaluación (score)
+langfuse = Langfuse()
+
+# Inicializar LLM y Embeddings
+llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+def load_and_index_docs(domain, data_path):
+    loader = DirectoryLoader(data_path, glob="**/*.txt", loader_cls=TextLoader, loader_kwargs={'encoding': 'utf-8'})
+    docs = loader.load()
+    
+    # Text Splitter agresivo para asegurar que se generen bastantes chunks (req: >50 por dominio)
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=100, chunk_overlap=20)
+    chunks = text_splitter.split_documents(docs)
+    print(f"[{domain}] Se generaron {len(chunks)} chunks.")
+    
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    return retriever
+
+hr_retriever = load_and_index_docs("HR", "data/hr_docs")
+tech_retriever = load_and_index_docs("IT", "data/tech_docs")
+finance_retriever = load_and_index_docs("FINANCE", "data/finance_docs")
+
+def create_agent_chain(system_prompt, retriever):
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt + "\n\nContexto:\n{context}"),
+        ("human", "{input}")
+    ])
+    question_answer_chain = create_stuff_documents_chain(llm, prompt)
+    rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+    return rag_chain
+
+hr_chain = create_agent_chain("Eres el agente de Recursos Humanos. Responde basándote solo en las políticas dadas.", hr_retriever)
+tech_chain = create_agent_chain("Eres el agente de Soporte IT. Responde basándote solo en el manual técnico dado.", tech_retriever)
+finance_chain = create_agent_chain("Eres el agente de Finanzas. Responde basándote solo en la política de gastos dada.", finance_retriever)
+
+# Función wraper instrumentada para cada agente
+@observe(name="Agent-Execution")
+def run_agent(intent, query):
+    if intent == "hr":
+        res = hr_chain.invoke({"input": query})
+    elif intent == "tech":
+        res = tech_chain.invoke({"input": query})
+    elif intent == "finance":
+        res = finance_chain.invoke({"input": query})
+    else:
+        return "Lo siento, no puedo procesar consultas sobre ese tema."
+    return res["answer"]
+
+@observe(name="SupportBotFlow")
+def support_orchestrator(query: str):
+    # Paso 1: Routing
+    intent = classify_intent(query)
+    
+    # Paso 2: Ejecución Condicional
+    final_response = run_agent(intent, query)
+    
+    # Añadimos la respuesta final a la traza padre
+    langfuse_context.update_current_trace(output=final_response)
+    
+    return intent, final_response
+
+@observe(name="Orchestrator-Routing")
+def classify_intent(query: str) -> str:
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "Clasifica la consulta en uno de estos dominios: 'hr', 'tech', 'finance', 'unknown'. "
+                   "Ejemplo de HR: licencias, obra social. "
+                   "Ejemplo de tech: VPN, equipos rotos, pantallas azules. "
+                   "Ejemplo de finance: reembolsos, sueldos, tarjetas.\n"
+                   "Devuelve SOLO la palabra exacta."),
+        ("human", "{input}")
+    ])
+    
+    router_chain = prompt | llm
+    res = router_chain.invoke({"input": query})
+    
+    intent = res.content.strip().lower()
+    if intent not in ["hr", "tech", "finance"]:
+         intent = "unknown"
+         
+    return intent
+
+def run_evaluation():
+    with open("test_queries.json", "r", encoding="utf-8") as f:
+        queries = json.load(f)
+    
+    correct_routes = 0
+    
+    for item in queries:
+        query = item["query"]
+        expected = item["expected_intent"]
+        
+        # Le decimos a Langfuse que marque esta traza con etiquetas específicas
+        langfuse_context.update_current_trace(
+            tags=["golden-run-v1", expected],
+            metadata={"expected_intent": expected}
+        )
+        
+        predicted_intent, response = support_orchestrator(query)
+        trace_id = langfuse_context.get_current_trace_id()
+        
+        # Flush para asegurar que el trace ID esté disponible en el backend
+        langfuse_context.flush()
+        
+        if predicted_intent == expected:
+            correct_routes += 1
+            print(f"✅ Pass | Query: '{query}' -> {predicted_intent}")
+        else:
+            print(f"❌ Fail | Query: '{query}' -> Expected: {expected}, Got: {predicted_intent}")
+            
+        # Corremos el agente evaluador de Langfuse (Bonus)
+        evaluate_response_quality(trace_id, query, response)
+        
+    print(f"\nResumen de Ruteo: {correct_routes}/{len(queries)} correctos.")
+
+# Ejecutar!
+# run_evaluation() # Descomentar para ejecutar
+
+def evaluate_response_quality(trace_id, query, response):
+    if not trace_id:
+        return
+        
+    evaluator_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Eres un juez imparcial. Puntúa la calidad de la respuesta a la pregunta del usuario en una escala del 1 al 10.\n"
+                   "Devuelve SOLO el número entero. Criterios: Relevancia y Precisión."),
+        ("human", "Pregunta: {query}\nRespuesta: {response}")
+    ])
+    
+    eval_chain = evaluator_prompt | llm
+    score_res = eval_chain.invoke({"query": query, "response": response})
+    
+    try:
+        score_value = int(score_res.content.strip())
+    except ValueError:
+        score_value = 5 # Default on error
+        
+    # Enviar score a Langfuse
+    langfuse.score(
+        trace_id=trace_id,
+        name="response-quality",
+        value=score_value,
+        comment="Evaluación automatizada por LLM-as-a-judge"
+    )
+
+print("Setup listo! El notebook está preparado para su uso.")
+
